@@ -15,11 +15,17 @@ pip install -r requirements.txt
 ## Usage
 
 ```python
-from comprocess_ai import process
+from comprocess_ai import run
 
 # Example usage
-result = process.run()
+result = run()
 print(result)
+```
+
+For more detailed examples, see the `example.py` file:
+
+```bash
+python example.py
 ```
 
 ## Project Structure
@@ -27,13 +33,16 @@ print(result)
 ```
 comprocess_ai/
 ├── README.md
+├── LICENSE
 ├── requirements.txt
 ├── setup.py
+├── example.py
 ├── comprocess_ai/
 │   ├── __init__.py
 │   └── process.py
 └── tests/
-    └── __init__.py
+    ├── __init__.py
+    └── test_process.py
 ```
 
 ## Development
