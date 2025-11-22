@@ -73,6 +73,38 @@ X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_scaled, look
 X_val_seq,   y_val_seq   = create_sequences(X_val_scaled,   y_val_scaled,   lookback)
 X_test_seq,  y_test_seq  = create_sequences(X_test_scaled,  y_test_scaled,  lookback)
 
+# -- 입력/타깃 배열 강제 정리(모든 시퀀스가 float32, y는 (n,1) 모양) --
+# X_*_seq가 object dtype이면 np.stack 사용
+if X_train_seq.dtype == object:
+    X_train_seq = np.stack(X_train_seq)
+if X_val_seq.dtype == object:
+    X_val_seq = np.stack(X_val_seq)
+if X_test_seq.dtype == object:
+    X_test_seq = np.stack(X_test_seq)
+
+# 강제 float32
+X_train_seq = np.asarray(X_train_seq, dtype=np.float32)
+X_val_seq   = np.asarray(X_val_seq,   dtype=np.float32)
+X_test_seq  = np.asarray(X_test_seq,  dtype=np.float32)
+
+y_train_seq = np.asarray(y_train_seq, dtype=np.float32)
+y_val_seq   = np.asarray(y_val_seq,   dtype=np.float32)
+y_test_seq  = np.asarray(y_test_seq,  dtype=np.float32)
+
+# y가 (n,)이면 (n,1)로 reshape
+if y_train_seq.ndim == 1:
+    y_train_seq = y_train_seq.reshape(-1, 1)
+if y_val_seq.ndim == 1:
+    y_val_seq = y_val_seq.reshape(-1, 1)
+if y_test_seq.ndim == 1:
+    y_test_seq = y_test_seq.reshape(-1, 1)
+
+print("DEBUG shapes/dtypes:",
+      X_train_seq.shape, X_train_seq.dtype,
+      y_train_seq.shape, y_train_seq.dtype,
+      X_val_seq.shape, X_val_seq.dtype,
+      X_test_seq.shape, X_test_seq.dtype)
+
 # 6) 상태 출력
 print("df shape:", df.shape)
 print("X_train_seq shape:", X_train_seq.shape)
@@ -82,3 +114,121 @@ print("X_test_seq shape:", X_test_seq.shape)
 
 # 필요한 객체들을 이후 모델 학습에 사용할 수 있도록 노출
 # df, train, val, test, scaler_X, scaler_y, X_train_seq, y_train_seq, X_val_seq, y_val_seq, X_test_seq, y_test_seq
+
+# ------------------ LSTM 모델: 학습, 평가, 시각화 추가 코드 ------------------
+import os
+import matplotlib.pyplot as plt
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_percentage_error
+
+# 재현성(완전한 재현은 환경에 따라 다름)
+import tensorflow as tf
+np.random.seed(42)
+tf.random.set_seed(42)
+
+model_dir = Path.cwd() / "models"
+model_dir.mkdir(parents=True, exist_ok=True)
+model_path = model_dir / "lstm_usd_model.h5"
+
+# 모델 설계 (간단하고 안정적인 기본 구조)
+n_features = X_train_seq.shape[2]  # 2
+model = Sequential([
+    LSTM(64, input_shape=(lookback, n_features), return_sequences=False),
+    Dropout(0.2),
+    Dense(32, activation="relu"),
+    Dense(1, activation="linear")
+])
+model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+
+# 콜백
+es = EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True)
+mc = ModelCheckpoint(str(model_path), monitor="val_loss", save_best_only=True, verbose=0)
+
+# 학습
+history = model.fit(
+    X_train_seq, y_train_seq,
+    validation_data=(X_val_seq, y_val_seq),
+    epochs=200,
+    batch_size=16,
+    callbacks=[es, mc],
+    verbose=1
+)
+
+# 예측 (스케일된 값)
+y_train_pred_s = model.predict(X_train_seq)
+y_val_pred_s   = model.predict(X_val_seq)
+y_test_pred_s  = model.predict(X_test_seq)
+
+# 역변환 (원 단위 USD)
+y_train_true = scaler_y.inverse_transform(y_train_seq.reshape(-1, 1))
+y_train_pred = scaler_y.inverse_transform(y_train_pred_s)
+
+y_val_true = scaler_y.inverse_transform(y_val_seq.reshape(-1, 1))
+y_val_pred = scaler_y.inverse_transform(y_val_pred_s)
+
+y_test_true = scaler_y.inverse_transform(y_test_seq.reshape(-1, 1))
+y_test_pred = scaler_y.inverse_transform(y_test_pred_s)
+
+# 평가 지표 계산
+def compute_metrics(y_t, y_p):
+    rmse = np.sqrt(mean_squared_error(y_t, y_p))
+    mae = mean_absolute_error(y_t, y_p)
+    mape = mean_absolute_percentage_error(y_t, y_p)
+    r2 = r2_score(y_t, y_p)
+    return {"RMSE": rmse, "MAE": mae, "MAPE": mape, "R2": r2}
+
+metrics = {
+    "Train": compute_metrics(y_train_true, y_train_pred),
+    "Val": compute_metrics(y_val_true, y_val_pred),
+    "Test": compute_metrics(y_test_true, y_test_pred)
+}
+
+metrics_df = pd.DataFrame(metrics).T
+print("\nEvaluation metrics:")
+print(metrics_df)
+
+# 시각화: 학습곡선, 검증/테스트 예측 비교
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+# 학습곡선
+axes[0,0].plot(history.history["loss"], label="train_loss")
+axes[0,0].plot(history.history["val_loss"], label="val_loss")
+axes[0,0].set_title("Training / Validation Loss")
+axes[0,0].legend()
+
+# validation: 실제 vs 예측 (최근 일부만 보기)
+axes[0,1].plot(y_val_true, label="val_true")
+axes[0,1].plot(y_val_pred, label="val_pred")
+axes[0,1].set_title("Validation: Actual vs Predicted (USD)")
+axes[0,1].legend()
+
+# test: 실제 vs 예측
+axes[1,0].plot(y_test_true, label="test_true")
+axes[1,0].plot(y_test_pred, label="test_pred")
+axes[1,0].set_title("Test: Actual vs Predicted (USD)")
+axes[1,0].legend()
+
+# 잔차 히스토그램 (test)
+resid = (y_test_true - y_test_pred).ravel()
+axes[1,1].hist(resid, bins=15)
+axes[1,1].set_title("Test Residuals Histogram")
+
+plt.tight_layout()
+plot_dir = Path.cwd() / "plots"
+plot_dir.mkdir(parents=True, exist_ok=True)
+plot_file = plot_dir / "lstm_evaluation.png"
+plt.savefig(plot_file)
+print(f"Saved plot to {plot_file}")
+plt.close(fig)
+
+# 간단한 시각적 테이블 출력(터미널용)
+print("\nMetrics table:")
+print(metrics_df.round(4))
+
+# 끝: 모델과 스케일러는 파일로 저장(선택)
+import joblib
+joblib.dump(scaler_X, model_dir / "scaler_X.joblib")
+joblib.dump(scaler_y, model_dir / "scaler_y.joblib")
+print(f"Saved model to {model_path}, scalers to {model_dir}")
