@@ -2,233 +2,314 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    r2_score,
+)
+import matplotlib.pyplot as plt
+import joblib
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
 
-# 1) 파일 로드 (wide -> DataFrame)
-csv_path = Path.home() / "Downloads" / "AI.csv"
-if not csv_path.exists():
-    raise FileNotFoundError(f"CSV 파일을 찾을 수 없습니다: {csv_path}")
+# ---------------------------------------------------------------------
+# 0) Reproducibility & basic config
+# ---------------------------------------------------------------------
+np.random.seed(42)
+tf.random.set_seed(42)
 
-raw = pd.read_csv(csv_path, header=None, dtype=str)
-months = raw.iloc[0, 2:].astype(str).str.replace("월", "", regex=False)
-dates = pd.to_datetime(months, format="%Y%m")  # 월 단위 날짜 생성
+LOOKBACK = 24          # 더 긴 과거(24개월)를 보도록 변경
+BATCH_SIZE = 16
+EPOCHS = 300
 
-# 숫자 문자열에 쉼표 제거, 빈값은 NaN 처리
-def to_float_series(s):
+DATA_PATH = Path.home() / "Downloads" / "AI.csv"
+MODEL_DIR = Path.cwd() / "models"
+PLOT_DIR = Path.cwd() / "plots"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_PATH = MODEL_DIR / "lstm_usd_model_improved.keras"
+SCALER_X_PATH = MODEL_DIR / "scaler_X.joblib"
+SCALER_Y_PATH = MODEL_DIR / "scaler_y.joblib"
+PLOT_PATH = PLOT_DIR / "lstm_evaluation_improved.png"
+
+# 기간 설정
+TRAIN_PERIOD = ("2006-01-01", "2023-12-01")
+VAL_PERIOD   = ("2024-01-01", "2024-12-01")
+TEST_PERIOD  = ("2025-01-01", "2025-10-01")
+
+
+# ---------------------------------------------------------------------
+# 1) Data loading + preprocessing
+# ---------------------------------------------------------------------
+def to_float_series(s: pd.Series) -> pd.Series:
     s2 = s.astype(str).str.replace(",", "", regex=False).str.strip()
     s2 = s2.replace({"": np.nan, "nan": np.nan})
     return pd.to_numeric(s2, errors="coerce")
 
-usd_vals = to_float_series(raw.iloc[1, 2:])
-jpy_vals = to_float_series(raw.iloc[2, 2:])
 
-df = pd.DataFrame({"USD": usd_vals.values, "JPY100": jpy_vals.values}, index=dates)
-df.index.name = None
+def load_and_preprocess(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"CSV 파일을 찾을 수 없습니다: {path}")
 
-# 간단 확인
-print("원본 df shape:", df.shape)
-print(df.head(3))
+    raw = pd.read_csv(path, header=None, dtype=str)
 
-# 2) 전처리: 정렬, 월단위 인덱스 강제, 보간
-df = df.sort_index()
-df = df.asfreq("MS")  # 월 시작일 기준 인덱스 강제
-print("asfreq 후 누락값 개수:\n", df.isna().sum())
+    # 첫 행: yyyyMM 또는 yyyyMM월 형식
+    months = raw.iloc[0, 2:].astype(str).str.replace("월", "", regex=False)
+    dates = pd.to_datetime(months, format="%Y%m")
 
-df = df.interpolate(method="linear", limit_direction="both")
-print("보간 후 누락값 개수:\n", df.isna().sum())
+    usd_vals = to_float_series(raw.iloc[1, 2:])
+    jpy_vals = to_float_series(raw.iloc[2, 2:])
 
-# 3) 분할: train / val / test
-train = df.loc["2006-01-01":"2023-12-01"]
-val   = df.loc["2024-01-01":"2024-12-01"]
-test  = df.loc["2025-01-01":"2025-10-01"]
+    df = pd.DataFrame({"USD": usd_vals.values, "JPY100": jpy_vals.values}, index=dates)
+    df.index.name = None
 
-print("train/val/test shapes:", train.shape, val.shape, test.shape)
+    # 시계열 정렬 및 월별 주기 보정
+    df = df.sort_index()
+    df = df.asfreq("MS")
+    df = df.interpolate(method="linear", limit_direction="both")
 
-# 4) 스케일링: train만으로 fit
-scaler_X = MinMaxScaler(feature_range=(0, 1))
-scaler_y = MinMaxScaler(feature_range=(0, 1))
+    # 이상값 완화(winsorize)
+    df["USD_w"] = df["USD"].clip(df["USD"].quantile(0.01), df["USD"].quantile(0.99))
+    df["JPY100_w"] = df["JPY100"].clip(df["JPY100"].quantile(0.01), df["JPY100"].quantile(0.99))
 
-scaler_X.fit(train.values)            # 입력(USD, JPY100) 열별로 fit
-scaler_y.fit(train[["USD"]].values)   # 타깃(USD)만 fit
+    # 기본 사용 컬럼
+    df["USD_proc"] = df["USD_w"]
+    df["JPY100_proc"] = df["JPY100_w"]
 
-X_train_scaled = scaler_X.transform(train.values)
-y_train_scaled = scaler_y.transform(train[["USD"]].values)
+    # 1차 차분 / 퍼센트 변화 / 이동통계량
+    df["USD_diff1"] = df["USD_proc"].diff(1).fillna(0.0)
+    df["USD_pct_change"] = (
+        df["USD_proc"].pct_change().replace([np.inf, -np.inf], 0).fillna(0.0)
+    )
+    df["USD_roll3_mean"] = df["USD_proc"].rolling(3, min_periods=1).mean()
+    df["USD_roll6_std"] = df["USD_proc"].rolling(6, min_periods=1).std().fillna(0.0)
 
-X_val_scaled = scaler_X.transform(val.values)
-y_val_scaled = scaler_y.transform(val[["USD"]].values)
+    # 월(계절성) 더미
+    months = df.index.month
+    month_dummies = pd.get_dummies(months, prefix="m", drop_first=True)
+    month_dummies.index = df.index
+    df = pd.concat([df, month_dummies], axis=1)
 
-X_test_scaled = scaler_X.transform(test.values)
-y_test_scaled = scaler_y.transform(test[["USD"]].values)
+    # 결측/무한치 정리
+    df = df.replace([np.inf, -np.inf], np.nan).bfill().ffill()
 
-# 5) 시퀀스 생성 (LSTM 입력용: samples, lookback, features)
-lookback = 12
+    return df
 
-def create_sequences(X, y, lb):
-    xs, ys = [], []
-    for i in range(lb, len(X)):
-        xs.append(X[i - lb:i])
-        ys.append(y[i])  # 1-step ahead
-    return np.array(xs), np.array(ys)
 
-X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_scaled, lookback)
-X_val_seq,   y_val_seq   = create_sequences(X_val_scaled,   y_val_scaled,   lookback)
-X_test_seq,  y_test_seq  = create_sequences(X_test_scaled,  y_test_scaled,  lookback)
+# ---------------------------------------------------------------------
+# 2) Feature selection + scaling + sequence 만들기
+# ---------------------------------------------------------------------
+def create_scaled_sequences(df: pd.DataFrame, lookback: int):
+    # feature 컬럼 정의 (타깃은 USD_proc)
+    month_cols = [c for c in df.columns if c.startswith("m_")]
+    feature_cols = [
+        "USD_proc",
+        "JPY100_proc",
+        "USD_diff1",
+        "USD_pct_change",
+        "USD_roll3_mean",
+        "USD_roll6_std",
+    ] + month_cols
 
-# -- 입력/타깃 배열 강제 정리(모든 시퀀스가 float32, y는 (n,1) 모양) --
-# X_*_seq가 object dtype이면 np.stack 사용
-if X_train_seq.dtype == object:
-    X_train_seq = np.stack(X_train_seq)
-if X_val_seq.dtype == object:
-    X_val_seq = np.stack(X_val_seq)
-if X_test_seq.dtype == object:
-    X_test_seq = np.stack(X_test_seq)
+    # train 구간만 사용해서 scaler fit
+    train_df = df.loc[TRAIN_PERIOD[0] : TRAIN_PERIOD[1], feature_cols]
 
-# 강제 float32
-X_train_seq = np.asarray(X_train_seq, dtype=np.float32)
-X_val_seq   = np.asarray(X_val_seq,   dtype=np.float32)
-X_test_seq  = np.asarray(X_test_seq,  dtype=np.float32)
+    scaler_X = MinMaxScaler((0, 1))
+    scaler_y = MinMaxScaler((0, 1))
 
-y_train_seq = np.asarray(y_train_seq, dtype=np.float32)
-y_val_seq   = np.asarray(y_val_seq,   dtype=np.float32)
-y_test_seq  = np.asarray(y_test_seq,  dtype=np.float32)
+    scaler_X.fit(train_df.values)
+    scaler_y.fit(train_df[["USD_proc"]].values)
 
-# y가 (n,)이면 (n,1)로 reshape
-if y_train_seq.ndim == 1:
-    y_train_seq = y_train_seq.reshape(-1, 1)
-if y_val_seq.ndim == 1:
-    y_val_seq = y_val_seq.reshape(-1, 1)
-if y_test_seq.ndim == 1:
-    y_test_seq = y_test_seq.reshape(-1, 1)
+    # 전체 데이터에 스케일 적용
+    X_scaled = scaler_X.transform(df[feature_cols].values)
+    y_scaled = scaler_y.transform(df[["USD_proc"]].values)
 
-print("DEBUG shapes/dtypes:",
-      X_train_seq.shape, X_train_seq.dtype,
-      y_train_seq.shape, y_train_seq.dtype,
-      X_val_seq.shape, X_val_seq.dtype,
-      X_test_seq.shape, X_test_seq.dtype)
+    # 시퀀스 생성
+    X_all, y_all = [], []
+    for i in range(lookback, len(X_scaled)):
+        X_all.append(X_scaled[i - lookback : i])
+        y_all.append(y_scaled[i])
 
-# 6) 상태 출력
-print("df shape:", df.shape)
-print("X_train_seq shape:", X_train_seq.shape)
-print("y_train_seq shape:", y_train_seq.shape)
-print("X_val_seq shape:", X_val_seq.shape)
-print("X_test_seq shape:", X_test_seq.shape)
+    X_all = np.array(X_all, dtype=np.float32)
+    y_all = np.array(y_all, dtype=np.float32).reshape(-1, 1)
 
-# 필요한 객체들을 이후 모델 학습에 사용할 수 있도록 노출
-# df, train, val, test, scaler_X, scaler_y, X_train_seq, y_train_seq, X_val_seq, y_val_seq, X_test_seq, y_test_seq
+    seq_index = df.index[lookback:]
+    return X_all, y_all, seq_index, scaler_X, scaler_y, feature_cols
 
-# ------------------ LSTM 모델: 학습, 평가, 시각화 추가 코드 ------------------
-import os
-import matplotlib.pyplot as plt
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.metrics import mean_absolute_percentage_error
 
-# 재현성(완전한 재현은 환경에 따라 다름)
-import tensorflow as tf
-np.random.seed(42)
-tf.random.set_seed(42)
+# ---------------------------------------------------------------------
+# 3) Train / Val / Test split
+# ---------------------------------------------------------------------
+def split_by_period(X_all, y_all, seq_index):
+    train_end = seq_index.get_loc(TRAIN_PERIOD[1])
+    val_end = seq_index.get_loc(VAL_PERIOD[1])
 
-model_dir = Path.cwd() / "models"
-model_dir.mkdir(parents=True, exist_ok=True)
-model_path = model_dir / "lstm_usd_model.h5"
+    X_train = X_all[: train_end + 1]
+    y_train = y_all[: train_end + 1]
 
-# 모델 설계 (간단하고 안정적인 기본 구조)
-n_features = X_train_seq.shape[2]  # 2
-model = Sequential([
-    LSTM(64, input_shape=(lookback, n_features), return_sequences=False),
-    Dropout(0.2),
-    Dense(32, activation="relu"),
-    Dense(1, activation="linear")
-])
-model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    X_val = X_all[train_end + 1 : val_end + 1]
+    y_val = y_all[train_end + 1 : val_end + 1]
 
-# 콜백
-es = EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True)
-mc = ModelCheckpoint(str(model_path), monitor="val_loss", save_best_only=True, verbose=0)
+    X_test = X_all[val_end + 1 :]
+    y_test = y_all[val_end + 1 :]
 
-# 학습
-history = model.fit(
-    X_train_seq, y_train_seq,
-    validation_data=(X_val_seq, y_val_seq),
-    epochs=200,
-    batch_size=16,
-    callbacks=[es, mc],
-    verbose=1
-)
+    return X_train, y_train, X_val, y_val, X_test, y_test
 
-# 예측 (스케일된 값)
-y_train_pred_s = model.predict(X_train_seq)
-y_val_pred_s   = model.predict(X_val_seq)
-y_test_pred_s  = model.predict(X_test_seq)
 
-# 역변환 (원 단위 USD)
-y_train_true = scaler_y.inverse_transform(y_train_seq.reshape(-1, 1))
-y_train_pred = scaler_y.inverse_transform(y_train_pred_s)
+# ---------------------------------------------------------------------
+# 4) Model building
+# ---------------------------------------------------------------------
+def build_model(input_shape):
+    model = Sequential([
+        # 1층 LSTM: 시퀀스 전체를 다음 층으로 전달
+        LSTM(
+            64,
+            return_sequences=True,
+            input_shape=input_shape,
+            dropout=0.2,
+            recurrent_dropout=0.2,
+            kernel_regularizer=l2(1e-4),
+        ),
+        # 2층 LSTM: 마지막 시점만 출력
+        LSTM(
+            32,
+            dropout=0.2,
+            recurrent_dropout=0.2,
+            kernel_regularizer=l2(1e-4),
+        ),
+        Dropout(0.3),
+        Dense(16, activation="relu", kernel_regularizer=l2(1e-4)),
+        Dense(1, activation="linear"),
+    ])
 
-y_val_true = scaler_y.inverse_transform(y_val_seq.reshape(-1, 1))
-y_val_pred = scaler_y.inverse_transform(y_val_pred_s)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                  loss="mse",
+                  metrics=["mae"])
+    return model
 
-y_test_true = scaler_y.inverse_transform(y_test_seq.reshape(-1, 1))
-y_test_pred = scaler_y.inverse_transform(y_test_pred_s)
 
-# 평가 지표 계산
-def compute_metrics(y_t, y_p):
-    rmse = np.sqrt(mean_squared_error(y_t, y_p))
-    mae = mean_absolute_error(y_t, y_p)
-    mape = mean_absolute_percentage_error(y_t, y_p)
-    r2 = r2_score(y_t, y_p)
-    return {"RMSE": rmse, "MAE": mae, "MAPE": mape, "R2": r2}
+# ---------------------------------------------------------------------
+# 5) Metric 계산 + 시각화
+# ---------------------------------------------------------------------
+def compute_metrics(y_true, y_pred):
+    return {
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "MAPE": float(mean_absolute_percentage_error(y_true, y_pred)),
+        "R2": float(r2_score(y_true, y_pred)),
+    }
 
-metrics = {
-    "Train": compute_metrics(y_train_true, y_train_pred),
-    "Val": compute_metrics(y_val_true, y_val_pred),
-    "Test": compute_metrics(y_test_true, y_test_pred)
-}
 
-metrics_df = pd.DataFrame(metrics).T
-print("\nEvaluation metrics:")
-print(metrics_df)
+def plot_results(history, y_val_true, y_val_pred, y_test_true, y_test_pred, save_path: Path):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-# 시각화: 학습곡선, 검증/테스트 예측 비교
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-# 학습곡선
-axes[0,0].plot(history.history["loss"], label="train_loss")
-axes[0,0].plot(history.history["val_loss"], label="val_loss")
-axes[0,0].set_title("Training / Validation Loss")
-axes[0,0].legend()
+    axes[0, 0].plot(history.history.get("loss", []), label="train_loss")
+    axes[0, 0].plot(history.history.get("val_loss", []), label="val_loss")
+    axes[0, 0].legend()
+    axes[0, 0].set_title("Train/Val Loss")
 
-# validation: 실제 vs 예측 (최근 일부만 보기)
-axes[0,1].plot(y_val_true, label="val_true")
-axes[0,1].plot(y_val_pred, label="val_pred")
-axes[0,1].set_title("Validation: Actual vs Predicted (USD)")
-axes[0,1].legend()
+    axes[0, 1].plot(y_val_true, label="val_true")
+    axes[0, 1].plot(y_val_pred, label="val_pred")
+    axes[0, 1].legend()
+    axes[0, 1].set_title("Validation Actual vs Pred")
 
-# test: 실제 vs 예측
-axes[1,0].plot(y_test_true, label="test_true")
-axes[1,0].plot(y_test_pred, label="test_pred")
-axes[1,0].set_title("Test: Actual vs Predicted (USD)")
-axes[1,0].legend()
+    axes[1, 0].plot(y_test_true, label="test_true")
+    axes[1, 0].plot(y_test_pred, label="test_pred")
+    axes[1, 0].legend()
+    axes[1, 0].set_title("Test Actual vs Pred")
 
-# 잔차 히스토그램 (test)
-resid = (y_test_true - y_test_pred).ravel()
-axes[1,1].hist(resid, bins=15)
-axes[1,1].set_title("Test Residuals Histogram")
+    resid = (y_test_true - y_test_pred).ravel()
+    axes[1, 1].hist(resid, bins=15)
+    axes[1, 1].set_title("Test Residuals")
 
-plt.tight_layout()
-plot_dir = Path.cwd() / "plots"
-plot_dir.mkdir(parents=True, exist_ok=True)
-plot_file = plot_dir / "lstm_evaluation.png"
-plt.savefig(plot_file)
-print(f"Saved plot to {plot_file}")
-plt.close(fig)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close(fig)
 
-# 간단한 시각적 테이블 출력(터미널용)
-print("\nMetrics table:")
-print(metrics_df.round(4))
 
-# 끝: 모델과 스케일러는 파일로 저장(선택)
-import joblib
-joblib.dump(scaler_X, model_dir / "scaler_X.joblib")
-joblib.dump(scaler_y, model_dir / "scaler_y.joblib")
-print(f"Saved model to {model_path}, scalers to {model_dir}")
+# ---------------------------------------------------------------------
+# 6) Main train pipeline
+# ---------------------------------------------------------------------
+def main():
+    # 데이터 로드 & 전처리
+    df = load_and_preprocess(DATA_PATH)
+
+    # 분포 확인(필요 없으면 주석 처리)
+    train_slice = df.loc[TRAIN_PERIOD[0] : TRAIN_PERIOD[1], "USD_proc"]
+    val_slice = df.loc[VAL_PERIOD[0] : VAL_PERIOD[1], "USD_proc"]
+    test_slice = df.loc[TEST_PERIOD[0] : TEST_PERIOD[1], "USD_proc"]
+    print("Distribution (USD_proc) — train mean/std:", train_slice.mean(), train_slice.std())
+    print("Distribution (USD_proc) — val   mean/std:", val_slice.mean(), val_slice.std())
+    print("Distribution (USD_proc) — test  mean/std:", test_slice.mean(), test_slice.std())
+
+    # 스케일링 + 시퀀스 생성
+    X_all, y_all, seq_index, scaler_X, scaler_y, feature_cols = create_scaled_sequences(df, LOOKBACK)
+    print("전체 시퀀스 shape:", X_all.shape, y_all.shape)
+    print("feature 수:", X_all.shape[2])
+    print("사용 feature cols:", feature_cols)
+
+    # Train/Val/Test 나누기
+    X_train, y_train, X_val, y_val, X_test, y_test = split_by_period(X_all, y_all, seq_index)
+
+    # 모델 생성
+    input_shape = (LOOKBACK, X_train.shape[2])
+    model = build_model(input_shape)
+    model.summary()
+
+    # 콜백 설정: EarlyStopping + ReduceLROnPlateau + ModelCheckpoint
+    es = EarlyStopping(monitor="val_loss", patience=25, restore_best_weights=True)
+    rlrop = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=10, min_lr=1e-5, verbose=1)
+    mc = ModelCheckpoint(str(MODEL_PATH), monitor="val_loss", save_best_only=True, verbose=1)
+
+    # 학습
+    history = model.fit(
+        X_train,
+        y_train,
+        validation_data=(X_val, y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=[es, rlrop, mc],
+        verbose=1,
+    )
+
+    # 예측 + inverse transform
+    y_train_pred_s = model.predict(X_train)
+    y_val_pred_s = model.predict(X_val)
+    y_test_pred_s = model.predict(X_test)
+
+    y_train_true = scaler_y.inverse_transform(y_train)
+    y_train_pred = scaler_y.inverse_transform(y_train_pred_s)
+
+    y_val_true = scaler_y.inverse_transform(y_val)
+    y_val_pred = scaler_y.inverse_transform(y_val_pred_s)
+
+    y_test_true = scaler_y.inverse_transform(y_test)
+    y_test_pred = scaler_y.inverse_transform(y_test_pred_s)
+
+    # 지표 계산
+    metrics = {
+        "Train": compute_metrics(y_train_true, y_train_pred),
+        "Val": compute_metrics(y_val_true, y_val_pred),
+        "Test": compute_metrics(y_test_true, y_test_pred),
+    }
+
+    metrics_df = pd.DataFrame(metrics).T
+    print("\nEvaluation metrics (improved model):")
+    print(metrics_df)
+
+    # 스케일러 저장
+    joblib.dump(scaler_X, SCALER_X_PATH)
+    joblib.dump(scaler_y, SCALER_Y_PATH)
+
+    # 시각화 저장
+    plot_results(history, y_val_true, y_val_pred, y_test_true, y_test_pred, PLOT_PATH)
+    print(f"Saved plot to {PLOT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
