@@ -63,44 +63,30 @@ JSON structure to output:
 Now provide the JSON based on the following user fields:
 """
 
-def build_prompt_from_fields(destination, budget, travel_date, preferences, extra):
-    merged_user_input = f"""
+def build_prompt(destination, budget, travel_date, preferences, extra):
+    return SYSTEM_PROMPT + f"""
 destination: {destination}
 budget: {budget}
 travel_date: {travel_date}
 preferences: {preferences}
 extra: {extra}
 """
-    return SYSTEM_PROMPT + merged_user_input
 
 
-async def request_itinerary(prompt: str) -> str:
+async def generate_travel_plan(destination, budget, travel_date, preferences, extra):
+    """
+    입력된 5가지 필드 기반으로 JSON 여행계획을 생성하는 단일 함수
+    """
+    # 1) 프롬프트 구성
+    prompt = build_prompt(destination, budget, travel_date, preferences, extra)
+
+    # 2) GPT 호출
     response = await client.responses.create(
         model="gpt-4o-mini",
         input=prompt,
         temperature=0.4,
         truncation="auto"
     )
+
+    # 3) JSON 텍스트 반환
     return response.output_text
-
-
-async def generate_itinerary(destination, budget, travel_date, preferences, extra):
-    prompt = build_prompt_from_fields(destination, budget, travel_date, preferences, extra)
-    result = await request_itinerary(prompt)
-    return result
-
-
-async def main():
-    # 예시 입력
-    dest = "오사카"
-    budget = "약 80만원"
-    date = "2025년 3월 1일 ~ 3월 4일"
-    prefs = "맛집, 쇼핑, 가벼운 산책"
-    extra = "해산물 알레르기 있음, 너무 타이트한 일정 싫음"
-
-    result = await generate_itinerary(dest, budget, date, prefs, extra)
-    print(result)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
